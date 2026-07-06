@@ -1,0 +1,9 @@
+# Image default goose config.
+#
+# To customise, mount an override rather than replacing this file, e.g.:
+#   docker run -v ./my-goose.yaml:/etc/goose/config.override.yaml:ro <image>
+
+# Prompt injection detection.
+# https://goose-docs.ai/docs/guides/security/prompt-injection-detection
+SECURITY_PROMPT_ENABLED: true
+SECURITY_PROMPT_THRESHOLD: 0.8

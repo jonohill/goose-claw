@@ -1,0 +1,253 @@
+diff --git a/crates/goose/src/security/adversary_inspector.rs b/crates/goose/src/security/adversary_inspector.rs
+index a6d00f5..a71262d 100644
+--- a/crates/goose/src/security/adversary_inspector.rs
++++ b/crates/goose/src/security/adversary_inspector.rs
+@@ -48,6 +48,39 @@ Err on the side of ALLOW — only block truly dangerous things."#;
+ 
+ const MAX_RECENT_USER_MESSAGES: usize = 4;
+ 
++/// Whether the adversary reviewer should fail OPEN (allow the tool call) when it
++/// cannot produce a verdict — i.e. no provider is available or the review call
++/// errored.
++///
++/// Upstream behaviour is fail-open. This build defaults to fail-CLOSED so a
++/// provider outage or review error blocks the reviewed tool instead of silently
++/// letting it through. Set `GOOSE_ADVERSARY_FAIL_CLOSED` to a falsey value
++/// (`0`, `false`, `no`, `off`) to restore the upstream fail-open behaviour
++/// without rebuilding.
++fn adversary_fails_open() -> bool {
++    std::env::var("GOOSE_ADVERSARY_FAIL_CLOSED")
++        .ok()
++        .map(|v| {
++            matches!(
++                v.trim().to_ascii_lowercase().as_str(),
++                "0" | "false" | "no" | "off"
++            )
++        })
++        .unwrap_or(false)
++}
++
++/// Outcome of an adversary review of a single tool call.
++enum ReviewOutcome {
++    /// The reviewer explicitly allowed the call.
++    Allow(String),
++    /// The reviewer explicitly blocked the call — a real detection. Always a
++    /// hard Deny; never downgraded regardless of mode or the fail-open setting.
++    Block(String),
++    /// The reviewer could not render a verdict (no provider available, or the
++    /// review call errored). Subject to the fail-open / fail-closed policy.
++    Unavailable(String),
++}
++
+ struct AdversaryConfig {
+     tools: Vec<String>,
+     rules: String,
+@@ -277,11 +310,13 @@ impl AdversaryInspector {
+         original_task: &str,
+         recent_messages: &[String],
+         rules: &str,
+-    ) -> Result<(bool, String)> {
++    ) -> ReviewOutcome {
+         let provider_guard = self.provider.lock().await;
+         let provider = match provider_guard.clone() {
+             Some(p) => p,
+-            None => return Ok((true, "No provider available".to_string())),
++            // No provider to consult — the reviewer cannot render a verdict.
++            // The caller applies the fail-open / fail-closed policy.
++            None => return ReviewOutcome::Unavailable("No provider available".to_string()),
+         };
+         drop(provider_guard);
+ 
+@@ -323,15 +358,23 @@ impl AdversaryInspector {
+         )];
+         let conversation = Conversation::new_unvalidated(check_messages);
+ 
+-        let model_config = resolve_model_config(&self.session_manager, session_id)
+-            .await
+-            .map_err(|e| anyhow::anyhow!("Could not resolve model config: {}", e))?;
+-        let (response, _usage) = crate::session_context::with_session_id(
++        let model_config = match resolve_model_config(&self.session_manager, session_id).await {
++            Ok(c) => c,
++            Err(e) => {
++                return ReviewOutcome::Unavailable(format!("Could not resolve model config: {}", e))
++            }
++        };
++        let (response, _usage) = match crate::session_context::with_session_id(
+             Some(session_id.to_string()),
+             provider.complete(&model_config, system_prompt, conversation.messages(), &[]),
+         )
+         .await
+-        .map_err(|e| anyhow::anyhow!("Adversary LLM call failed: {}", e))?;
++        {
++            Ok(r) => r,
++            Err(e) => {
++                return ReviewOutcome::Unavailable(format!("Adversary LLM call failed: {}", e))
++            }
++        };
+ 
+         let output: String = response
+             .content
+@@ -359,7 +402,7 @@ impl AdversaryInspector {
+             } else {
+                 reason
+             };
+-            Ok((false, reason))
++            ReviewOutcome::Block(reason)
+         } else {
+             let reason = output
+                 .lines()
+@@ -368,7 +411,7 @@ impl AdversaryInspector {
+                 .join(" ")
+                 .trim()
+                 .to_string();
+-            Ok((true, reason))
++            ReviewOutcome::Allow(reason)
+         }
+     }
+ }
+@@ -431,7 +474,7 @@ impl ToolInspector for AdversaryInspector {
+                 )
+                 .await
+             {
+-                Ok((true, reason)) => {
++                ReviewOutcome::Allow(reason) => {
+                     tracing::debug!(
+                         security.event_type = "adversary_detection",
+                         security.action = "ALLOW",
+@@ -450,7 +493,10 @@ impl ToolInspector for AdversaryInspector {
+                         finding_id: None,
+                     });
+                 }
+-                Ok((false, reason)) => {
++                // A real detection: the reviewer explicitly said BLOCK. Always a
++                // hard Deny — never softened to approval, regardless of mode or
++                // the fail-open setting.
++                ReviewOutcome::Block(reason) => {
+                     tracing::warn!(
+                         security.event_type = "adversary_detection",
+                         security.action = "BLOCK",
+@@ -469,25 +515,49 @@ impl ToolInspector for AdversaryInspector {
+                         finding_id: None,
+                     });
+                 }
+-                Err(e) => {
++                // The reviewer could not render a verdict. Fail OPEN: let it
++                // through (opt-in via GOOSE_ADVERSARY_FAIL_CLOSED=false).
++                ReviewOutcome::Unavailable(detail) if adversary_fails_open() => {
+                     tracing::warn!(
+                         security.event_type = "adversary_detection",
+                         security.action = "ALLOW",
+                         security.confidence = 0.0_f32,
+-                        security.explanation = %format!("error (fail-open): {}", e),
++                        security.explanation = %format!("unavailable (fail-open): {}", detail),
+                         tool.name = %tool_call_name,
+                         tool.request_id = %request.id,
+-                        "adversary review: error (fail-open)"
++                        "adversary review: unavailable (fail-open)"
+                     );
+                     results.push(InspectionResult {
+                         tool_request_id: request.id.clone(),
+                         action: InspectionAction::Allow,
+-                        reason: format!("Adversary error (fail-open): {}", e),
++                        reason: format!("Adversary unavailable (fail-open): {}", detail),
+                         confidence: 0.0,
+                         inspector_name: self.name().to_string(),
+                         finding_id: None,
+                     });
+                 }
++                // Fail CLOSED (the default). The reviewer could not vet this
++                // call, so treat that as a hard failure: Deny it and surface the
++                // failure reason back to the calling LLM.
++                ReviewOutcome::Unavailable(detail) => {
++                    tracing::warn!(
++                        security.event_type = "adversary_detection",
++                        security.action = "BLOCK",
++                        security.confidence = 1.0_f32,
++                        security.explanation = %format!("unavailable (fail-closed): {}", detail),
++                        tool.name = %tool_call_name,
++                        tool.request_id = %request.id,
++                        "adversary review: unavailable (fail-closed)"
++                    );
++                    results.push(InspectionResult {
++                        tool_request_id: request.id.clone(),
++                        action: InspectionAction::Deny,
++                        reason: format!("🛡️ Adversary fail-closed (review unavailable): {}", detail),
++                        confidence: 1.0,
++                        inspector_name: self.name().to_string(),
++                        finding_id: None,
++                    });
++                }
+             }
+         }
+ 
+diff --git a/crates/goose/tests/adversary_inspector_tests.rs b/crates/goose/tests/adversary_inspector_tests.rs
+index 8ace7da..e798c28 100644
+--- a/crates/goose/tests/adversary_inspector_tests.rs
++++ b/crates/goose/tests/adversary_inspector_tests.rs
+@@ -80,7 +80,9 @@ async fn test_adversary_enabled_default_tools() {
+         vec![MessageContent::text("build the project")],
+     )];
+ 
+-    // shell is reviewed by default — no provider means fail-open (Allow)
++    // shell is reviewed by default — with no provider the reviewer is
++    // unavailable, which fails CLOSED in this build: a hard Deny. Upstream
++    // default is fail-open (Allow); see GOOSE_ADVERSARY_FAIL_CLOSED.
+     let results = inspector
+         .inspect(
+             "test-session",
+@@ -98,7 +100,7 @@ async fn test_adversary_enabled_default_tools() {
+     assert_eq!(results.len(), 1);
+     assert!(matches!(
+         results[0].action,
+-        goose::tool_inspection::InspectionAction::Allow
++        goose::tool_inspection::InspectionAction::Deny
+     ));
+ 
+     // write is NOT reviewed by default — skipped entirely
+@@ -119,6 +121,46 @@ async fn test_adversary_enabled_default_tools() {
+     assert!(results.is_empty());
+ }
+ 
++#[tokio::test]
++async fn test_adversary_fail_closed_auto_mode_denies() {
++    let tmp = tempfile::tempdir().unwrap();
++    write_adversary_md(tmp.path(), "BLOCK everything for testing");
++
++    // No provider -> the reviewer is Unavailable -> fail-closed policy applies.
++    let provider = Arc::new(Mutex::new(None));
++    let inspector = AdversaryInspector::with_config_dir(
++        provider,
++        Arc::new(goose::session::SessionManager::new(
++            tmp.path().to_path_buf(),
++        )),
++        tmp.path().to_path_buf(),
++    );
++
++    let messages = vec![Message::new(
++        rmcp::model::Role::User,
++        chrono::Utc::now().timestamp(),
++        vec![MessageContent::text("build the project")],
++    )];
++
++    // A fail-closed review is a hard Deny regardless of mode — even in Auto,
++    // where there is no human in the loop (see GOOSE_ADVERSARY_FAIL_CLOSED).
++    let results = inspector
++        .inspect(
++            "test-session",
++            &[make_request("r1", "shell", object!({"command": "cargo build"}))],
++            &messages,
++            GooseMode::Auto,
++        )
++        .await
++        .unwrap();
++
++    assert_eq!(results.len(), 1);
++    assert!(matches!(
++        results[0].action,
++        goose::tool_inspection::InspectionAction::Deny
++    ));
++}
++
+ #[tokio::test]
+ async fn test_adversary_custom_tool_filter() {
+     let tmp = tempfile::tempdir().unwrap();
