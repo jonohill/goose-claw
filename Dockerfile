@@ -53,10 +53,11 @@ RUN git init -q . && \
 # binary. Patches (in apply order by filename):
 #   0001-adversary-fail-closed.patch — adversary mode fails CLOSED when the
 #     reviewer cannot render a verdict (no provider / review error) instead of
-#     the upstream fail-open. In Auto mode the tool call is escalated to a human
-#     approval prompt; in every other mode it is hard-denied. A real BLOCK
-#     verdict is always a hard deny regardless of mode. Runtime-toggleable back
-#     to fail-open via GOOSE_ADVERSARY_FAIL_CLOSED (see runtime stage).
+#     the upstream fail-open. The reviewed tool call is hard-denied in every
+#     mode, including Auto: claw mode runs autonomously, so there is no human to
+#     escalate an approval prompt to. A real BLOCK verdict is likewise always a
+#     hard deny regardless of mode. Runtime-toggleable back to fail-open via
+#     GOOSE_ADVERSARY_FAIL_CLOSED (see runtime stage).
 COPY patches/ /build/patches/
 RUN for p in /build/patches/*.patch; do \
       echo "Applying $p" && git apply --verbose "$p"; \
@@ -132,10 +133,10 @@ ENV HOME=/home/goose \
     GOOSE_TLS=false \
     # Adversary mode (enabled by mounting ~/.config/goose/adversary.md) fails
     # CLOSED in this build: if the adversary reviewer can't reach a verdict
-    # (no provider / review error), the reviewed tool call is escalated to a
-    # human approval prompt in Auto mode and hard-DENIED in every other mode.
-    # Set this to false/0/no/off to restore upstream fail-open (allow) behaviour
-    # without a rebuild.
+    # (no provider / review error), the reviewed tool call is hard-DENIED in
+    # every mode, including Auto (claw mode is autonomous — there is no human to
+    # escalate an approval prompt to). Set this to false/0/no/off to restore
+    # upstream fail-open (allow) behaviour without a rebuild.
     GOOSE_ADVERSARY_FAIL_CLOSED=true \
     # The baked claw adversary policy (/etc/goose/adversary.default.md) is
     # installed to ~/.config/goose/adversary.md by the entrypoint, enabling the
