@@ -1,0 +1,66 @@
+# OpenAB config for goose-claw (Slack edition).
+#
+# OpenAB connects to Slack via Socket Mode (outbound WebSocket — no public
+# ingress) and spawns one `goose acp` child per Slack thread. ${VAR} is expanded
+# from the process environment at load time; provide the referenced vars at
+# runtime, e.g.:
+#   docker run --rm \
+#     -e SLACK_BOT_TOKEN=xoxb-... \
+#     -e SLACK_APP_TOKEN=xapp-... \
+#     -e ANTHROPIC_API_KEY=sk-ant-... \
+#     -v goose-state:/data \
+#     ghcr.io/<you>/goose-claw-slack
+#
+# To customise, mount your own file over /etc/openab/config.toml.
+
+# --- Slack adapter (Socket Mode) -------------------------------------------
+# App setup (scopes, tokens, events) is documented by OpenAB in docs/slack.md.
+# Required scopes include app_mentions:read, chat:write, channels:history,
+# groups:history, reactions:write, users:read, and assistant:write (for the
+# default assistant_mode streaming/status line).
+[slack]
+bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
+app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode
+allow_all_channels = true            # tighten with allow_all_channels = false + allowed_channels
+allow_all_users = true               # tighten with allow_all_users = false + allowed_users
+# assistant_mode = true              # default: native AI-app streaming + status line.
+                                     # Set false if your Slack app is not an AI app
+                                     # (falls back to post+edit + emoji reactions).
+
+# --- Agent: the patched goose CLI in ACP-over-stdio mode -------------------
+# OpenAB fork/execs this per thread and speaks JSON-RPC over its stdio.
+[agent]
+command = "goose"
+args = ["acp"]
+working_dir = "/data/workspace"
+
+# ⚠️ Anything in [agent].env is visible to the agent process and could be
+# surfaced via prompt injection. The provider API key must live here regardless
+# (both the agent and the adversary reviewer need the provider), so treat this
+# container's provider key as agent-reachable.
+#
+# These are set here rather than as image env because OpenAB only forwards
+# HOME/PATH/USER to the child by default (see inherit_env in OpenAB docs).
+[agent.env]
+# --- goose autonomy + security ---
+GOOSE_MODE = "auto"                       # self-approve tools; no ACP permission
+                                          # prompt (Slack has no approval UI). The
+                                          # adversary reviewer still gates every call.
+GOOSE_ADVERSARY_FAIL_CLOSED = "true"      # block reviewed calls the reviewer can't
+                                          # vet (provider outage / review error).
+# --- provider: Ollama Cloud via its OpenAI-compatible endpoint ---
+# (verified working with the adversary reviewer using glm-5.2:cloud). Supply
+# OLLAMA_API_KEY at runtime: docker run -e OLLAMA_API_KEY=... ...
+GOOSE_PROVIDER = "openai"
+GOOSE_MODEL = "glm-5.2:cloud"
+OPENAI_BASE_URL = "https://ollama.com/v1"
+OPENAI_API_KEY = "${OLLAMA_API_KEY}"
+# Anthropic alternative:
+#   GOOSE_PROVIDER = "anthropic"
+#   GOOSE_MODEL = "claude-sonnet-5"
+#   ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+
+# --- Session pool ----------------------------------------------------------
+[pool]
+max_sessions = 10
+session_ttl_hours = 24

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Layer the user's config override on top of the image default, then start goosed.
+# Prepare goose's config (config.yaml + adversary.md), then exec the given
+# command. The command is whatever CMD/args the image passes ("$@") — e.g.
+# `goosed agent` for the HTTP-server image, or `openab run -c ...` for the
+# Slack/OpenAB image, which in turn spawns `goose acp` as a child. Either way
+# goose reads the same ~/.config/goose we lay down here, so the adversary
+# reviewer is active regardless of which frontend drives the agent.
 #
 # Precedence (highest wins): user override > baked default.
 # Merge is a per-key deep merge; arrays are replaced (not appended).
@@ -10,7 +15,11 @@ DEFAULT=/etc/goose/config.default.yaml
 OVERRIDE=${GOOSE_CONFIG_OVERRIDE:-/etc/goose/config.override.yaml}
 TARGET="${HOME}/.config/goose/config.yaml"
 
-mkdir -p "$(dirname "$TARGET")"
+# HOME (/data) is the single state mountpoint. Recreate the state dirs here so a
+# fresh/empty mount (bind mount, or a first-run named volume that shadows the
+# image's dirs) still has the layout goose + OpenAB expect. The baked defaults
+# we install below live in /etc, not HOME, so they survive an empty mount.
+mkdir -p "$(dirname "$TARGET")" "${HOME}/.openab" "${HOME}/workspace"
 
 if [[ -f "$OVERRIDE" && "${GOOSE_CONFIG_MERGE:-on}" == "off" ]]; then
   # Power-user escape hatch: use the override as-is, ignore baked defaults.
@@ -48,4 +57,7 @@ elif [[ -f "$ADV_DEFAULT" ]]; then
   cp "$ADV_DEFAULT" "$ADV_TARGET"
 fi
 
-exec /usr/local/bin/goosed "$@"
+# Hand off to the image's command (goosed, openab, or anything else). Keeping
+# this generic lets a single entrypoint serve every image variant; the goose
+# config/adversary setup above is the shared invariant.
+exec "$@"

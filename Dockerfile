@@ -1,27 +1,13 @@
 # syntax=docker/dockerfile:1.4
 
 # ---------------------------------------------------------------------------
-# Build stage
+# Build stage 1: the patched goose CLI (provides `goose acp`)
 # ---------------------------------------------------------------------------
-# Matches rust-toolchain.toml (channel 1.92). rustup in the base image will
-# still honour rust-toolchain.toml if the pinned version ever drifts.
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.92-bookworm AS goose-builder
 
-# Which repo / revision to build.
-#
-# GOOSE_REF is pinned to the exact commit that patches/0001-adversary-fail-closed.patch
-# was generated against, so `git apply` always succeeds. You can override it with
-# --build-arg GOOSE_REF=<branch|tag|sha> to track a different revision, but the
-# patch may then fail to apply and the build will stop by design — better to fail
-# loudly than ship a binary that silently reverted to upstream fail-open.
 ARG GOOSE_REPO=https://github.com/aaif-goose/goose.git
 ARG GOOSE_REF=a0aed81f36076cfe48def4b21c04d7f0d33072e8
 
-# Cargo feature set for goose-server. Default drops the heavy `local-inference`
-# feature (statically-linked llama.cpp/GGML, ~80MB of binary) — the server talks
-# to remote providers instead. `portable-default` = rustls-tls, aws-providers,
-# telemetry, otel. To re-enable on-device inference, pass e.g.:
-#   --build-arg GOOSE_FEATURES="portable-default,local-inference"
 ARG GOOSE_FEATURES=portable-default
 
 RUN apt-get update && \
@@ -38,33 +24,21 @@ RUN apt-get update && \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone the requested revision (shallow, to keep the layer small). This form
-# fetches a single commit and works for a branch name, a tag, OR a full commit
-# SHA — GitHub allows fetching a reachable SHA directly, which `git clone
-# --branch` does not.
 WORKDIR /build
 RUN git init -q . && \
     git remote add origin "${GOOSE_REPO}" && \
     git fetch --depth 1 origin "${GOOSE_REF}" && \
     git checkout -q FETCH_HEAD
 
-# Apply local source patches on top of the checked-out revision, before building.
-# A failure here stops the build rather than silently producing an unpatched
-# binary. Patches (in apply order by filename):
-#   0001-adversary-fail-closed.patch — adversary mode fails CLOSED when the
-#     reviewer cannot render a verdict (no provider / review error) instead of
-#     the upstream fail-open. The reviewed tool call is hard-denied in every
-#     mode, including Auto: claw mode runs autonomously, so there is no human to
-#     escalate an approval prompt to. A real BLOCK verdict is likewise always a
-#     hard deny regardless of mode. Runtime-toggleable back to fail-open via
-#     GOOSE_ADVERSARY_FAIL_CLOSED (see runtime stage).
+# Apply local source patches. A failure here
+# stops the build rather than silently producing an unpatched, fail-open binary.
+#   0001-adversary-fail-closed.patch — adversary reviewer fails CLOSED when it
+#     cannot render a verdict; a real BLOCK is always a hard Deny.
 COPY patches/ /build/patches/
 RUN for p in /build/patches/*.patch; do \
       echo "Applying $p" && git apply --verbose "$p"; \
     done
 
-# Release build tuned for a small binary. Cache mounts keep the registry and
-# target dir warm across rebuilds (requires BuildKit / docker buildx).
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     CARGO_PROFILE_RELEASE_LTO=true \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
@@ -72,29 +46,68 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     CARGO_PROFILE_RELEASE_STRIP=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --package goose-server --bin goosed \
+    cargo build --release --package goose-cli --bin goose \
       --no-default-features --features "${GOOSE_FEATURES}" && \
-    cp /build/target/release/goosed /usr/local/bin/goosed
+    cp /build/target/release/goose /usr/local/bin/goose
+
+# ---------------------------------------------------------------------------
+# Build stage 2: the OpenAB harness
+# ---------------------------------------------------------------------------
+FROM rust:1.92-bookworm AS openab-builder
+
+ARG OPENAB_REPO=https://github.com/openabdev/openab.git
+# Pinned to a known-good revision (HEAD of main at time of writing). Override
+# with --build-arg OPENAB_REF=<tag|sha> to track a release.
+ARG OPENAB_REF=342f76dba25fd128be6debcbe78295ef9f430e00
+
+# Slack-only build: drops discord + the AWS SDK (secrets-aws / config-s3 /
+# agentcore) + pre-seed, which are the bulk of the compile. For the full
+# upstream default (adds Discord + AWS integrations) pass:
+#   --build-arg OPENAB_FEATURES=default-passthrough  (see below)
+ARG OPENAB_FEATURES=slack
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git \
+      build-essential \
+      cmake \
+      pkg-config \
+      libssl-dev \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /openab
+RUN git init -q . && \
+    git remote add origin "${OPENAB_REPO}" && \
+    git fetch --depth 1 origin "${OPENAB_REF}" && \
+    git checkout -q FETCH_HEAD
+
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+# `slack` (default) -> --no-default-features --features slack (lean).
+# `default-passthrough` -> plain `cargo build` (upstream default features).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/openab/target \
+    if [ "${OPENAB_FEATURES}" = "default-passthrough" ]; then \
+      cargo build --release --bin openab; \
+    else \
+      cargo build --release --bin openab \
+        --no-default-features --features "${OPENAB_FEATURES}"; \
+    fi && \
+    cp /openab/target/release/openab /usr/local/bin/openab
 
 # ---------------------------------------------------------------------------
 # Runtime stage
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-# yq (mikefarah) — used by the entrypoint to deep-merge the baked default
-# config with any user-supplied override. Single static Go binary. Pinned for
-# reproducible builds. TARGETARCH is provided automatically by buildx.
 ARG TARGETARCH=amd64
 ARG YQ_VERSION=v4.53.3
 
-# Runtime dependencies:
-#  - libdbus-1-3   -> dbus (kept for safety; not needed once system-keyring is off)
-#  - libxcb1       -> transitive graphics dep
-#  - git / curl    -> commonly needed by agent tooling
-# NOTE: libgomp1 (OpenMP) dropped along with the local-inference feature.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
+      tini \
+      ripgrep \
       libssl3 \
       libdbus-1-3 \
       libxcb1 \
@@ -106,50 +119,45 @@ RUN apt-get update && \
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH}" \
       -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
 
-COPY --from=builder /usr/local/bin/goosed /usr/local/bin/goosed
+COPY --from=goose-builder  /usr/local/bin/goose  /usr/local/bin/goose
+COPY --from=openab-builder /usr/local/bin/openab /usr/local/bin/openab
 
-# Baked default config + entrypoint that layers user overrides on top of it.
-COPY config.default.yaml /etc/goose/config.default.yaml
-# Baked default adversary policy (claw mode). Its presence at
-# ~/.config/goose/adversary.md — placed there by the entrypoint — turns the
-# adversary reviewer ON by default. Override with a mounted
-# /etc/goose/adversary.override.md, or disable via GOOSE_ADVERSARY_DISABLE.
-COPY adversary.default.md /etc/goose/adversary.default.md
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# Baked goose config + adversary policy + the shared entrypoint
+# The entrypoint lays down ~/.config/goose (config.yaml +
+# adversary.md) before exec'ing OpenAB, so the reviewer is active for the
+# `goose acp` children.
+COPY config.default.yaml   /etc/goose/config.default.yaml
+COPY adversary.default.md  /etc/goose/adversary.default.md
+COPY docker-entrypoint.sh  /usr/local/bin/docker-entrypoint.sh
+# Default OpenAB config: Slack adapter + `[agent] command = goose acp`.
+COPY config.openab.toml    /etc/openab/config.toml
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Non-root user
-RUN useradd -m -u 1000 -s /bin/bash goose && \
-    mkdir -p /home/goose/.config/goose && \
-    chown -R goose:goose /home/goose
+RUN useradd -u 1000 -s /bin/bash -d /data goose && \
+    mkdir -p /data/.config/goose /data/.openab /data/workspace && \
+    chown -R goose:goose /data
 
-ENV HOME=/home/goose \
+ENV HOME=/data \
     PATH=/usr/local/bin:$PATH \
-    # Bind to all interfaces so the server is reachable from outside the container.
-    GOOSE_HOST=0.0.0.0 \
-    GOOSE_PORT=3000 \
-    # TLS defaults to on in goosed; disable for plain HTTP, or mount certs and
-    # set GOOSE_TLS=true with GOOSE_TLS_CERT_PATH / GOOSE_TLS_KEY_PATH.
-    GOOSE_TLS=false \
-    # Adversary mode (enabled by mounting ~/.config/goose/adversary.md) fails
-    # CLOSED in this build: if the adversary reviewer can't reach a verdict
-    # (no provider / review error), the reviewed tool call is hard-DENIED in
-    # every mode, including Auto (claw mode is autonomous — there is no human to
-    # escalate an approval prompt to). Set this to false/0/no/off to restore
-    # upstream fail-open (allow) behaviour without a rebuild.
-    GOOSE_ADVERSARY_FAIL_CLOSED=true \
-    # The baked claw adversary policy (/etc/goose/adversary.default.md) is
-    # installed to ~/.config/goose/adversary.md by the entrypoint, enabling the
-    # reviewer by default. Set truthy to ship without it (reviewer off), or
-    # mount /etc/goose/adversary.override.md to replace the policy wholesale.
+    # Entrypoint-level knob: whether to install adversary.md at all (reviewer
+    # on/off). Read by the entrypoint, which runs before OpenAB starts.
     GOOSE_ADVERSARY_DISABLE=false
 
+# NOTE on env propagation: OpenAB only forwards HOME/PATH/USER to the `goose
+# acp` child by default. So goose's *runtime* knobs — GOOSE_MODE=auto,
+# GOOSE_ADVERSARY_FAIL_CLOSED, GOOSE_PROVIDER/GOOSE_MODEL and the provider API
+# key — are set in [agent].env in config.openab.toml, NOT here, otherwise they
+# would never reach the process that actually reads them. (Fail-closed is the
+# code default when GOOSE_ADVERSARY_FAIL_CLOSED is unset, so it is safe either
+# way; config.openab.toml sets it explicitly for clarity.)
+
 USER goose
-WORKDIR /home/goose
+WORKDIR /data
 
-EXPOSE 3000
-
-# The entrypoint merges baked defaults with any user override, then exec's
-# `goosed` with the given arguments. `goosed agent` starts the agent server.
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["agent"]
+# tini as PID 1 (reaps goose children) -> shared entrypoint (lays down goose
+# config) -> OpenAB, which connects to Slack and spawns `goose acp` per thread.
+# Provide SLACK_BOT_TOKEN / SLACK_APP_TOKEN and your provider key at runtime
+# (see config.openab.toml). No port is exposed — Slack Socket Mode is outbound.
+# Mount a volume at /data to persist all agent + OpenAB state across restarts.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
