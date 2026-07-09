@@ -1,0 +1,58 @@
+diff --git a/crates/goose/src/security/adversary_inspector.rs b/crates/goose/src/security/adversary_inspector.rs
+index a6d00f5..9021fdf 100644
+--- a/crates/goose/src/security/adversary_inspector.rs
++++ b/crates/goose/src/security/adversary_inspector.rs
+@@ -222,6 +222,28 @@ impl AdversaryInspector {
+         }
+     }
+ 
++    /// Strip OpenAB-style `<sender_context>{…}</sender_context>` envelopes that
++    /// multi-user front-ends prepend to each message. Left in place, that JSON
++    /// header alone can exceed the per-message truncation budget below and clip
++    /// the user's actual words out of the reviewer's context.
++    fn strip_sender_context(text: &str) -> String {
++        let mut out = String::with_capacity(text.len());
++        let mut rest = text;
++        while let Some(start) = rest.find("<sender_context>") {
++            out.push_str(&rest[..start]);
++            match rest[start..].find("</sender_context>") {
++                Some(end) => rest = &rest[start + end + "</sender_context>".len()..],
++                // Unterminated envelope: drop the remainder rather than leaking JSON.
++                None => {
++                    rest = "";
++                    break;
++                }
++            }
++        }
++        out.push_str(rest);
++        out.trim().to_string()
++    }
++
+     fn extract_recent_user_messages(messages: &[Message], count: usize) -> Vec<String> {
+         messages
+             .iter()
+@@ -237,6 +259,7 @@ impl AdversaryInspector {
+                     })
+                     .collect::<Vec<_>>()
+                     .join("\n");
++                let text = Self::strip_sender_context(&text);
+                 if text.is_empty() {
+                     None
+                 } else {
+@@ -262,6 +285,7 @@ impl AdversaryInspector {
+                     })
+                     .collect::<Vec<_>>()
+                     .join("\n");
++                let text = Self::strip_sender_context(&text);
+                 if !text.is_empty() {
+                     return safe_truncate(&text, 500);
+                 }
+@@ -288,7 +312,7 @@ impl AdversaryInspector {
+         let history_section = if !recent_messages.is_empty() {
+             let mut s = String::from("Recent user messages (oldest first):\n");
+             for (i, msg) in recent_messages.iter().enumerate() {
+-                let truncated = safe_truncate(msg, 200);
++                let truncated = safe_truncate(msg, 500);
+                 s.push_str(&format!("{}. {}\n", i + 1, truncated));
+             }
+             s.push('\n');
