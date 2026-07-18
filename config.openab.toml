@@ -53,6 +53,15 @@ GOOSE_MODE = "auto"                       # self-approve tools; no ACP permissio
                                           # adversary reviewer still gates every call.
 GOOSE_ADVERSARY_FAIL_CLOSED = "true"      # block reviewed calls the reviewer can't
                                           # vet (provider outage / review error).
+# --- hang-proofing: nothing may block waiting for interactive input ---------
+# The agent's shell has no TTY; a credential prompt, editor, or pager would
+# wedge the session silently. (Must live here: OpenAB only forwards
+# HOME/PATH/USER to the child.)
+GIT_TERMINAL_PROMPT = "0"                 # fail fast instead of prompting for creds
+EDITOR = "true"                           # no editor installed; `true` no-ops
+GIT_EDITOR = "true"
+PAGER = "cat"
+LANG = "C.UTF-8"
 # --- provider: Ollama Cloud via its OpenAI-compatible endpoint ---
 # (verified working with the adversary reviewer using glm-5.2:cloud). Supply
 # OLLAMA_API_KEY at runtime: docker run -e OLLAMA_API_KEY=... ...

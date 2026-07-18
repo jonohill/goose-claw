@@ -113,6 +113,12 @@ RUN apt-get update && \
       libxcb1 \
       curl \
       git \
+      python3 \
+      python3-venv \
+      jq \
+      procps \
+      unzip \
+      openssh-client \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

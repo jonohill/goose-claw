@@ -87,6 +87,19 @@ elif [[ -f "$AB_DEFAULT" ]]; then
   cp "$AB_DEFAULT" "$AB_TARGET"
 fi
 
+# ---------------------------------------------------------------------------
+# Git identity
+# ---------------------------------------------------------------------------
+# The agent's first `git commit` fails without an identity. Seed one unless the
+# mounted state already has it (a user-configured ~/.gitconfig wins — we only
+# fill the gaps). Override the defaults with GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL.
+git config --global user.name  >/dev/null 2>&1 || \
+  git config --global user.name  "${GIT_AUTHOR_NAME:-goose-claw}"
+git config --global user.email >/dev/null 2>&1 || \
+  git config --global user.email "${GIT_AUTHOR_EMAIL:-goose-claw@localhost}"
+git config --global init.defaultBranch >/dev/null 2>&1 || \
+  git config --global init.defaultBranch main
+
 # Hand off to the image's command (goosed, openab, or anything else). Keeping
 # this generic lets a single entrypoint serve every image variant; the goose
 # config/adversary setup above is the shared invariant.
