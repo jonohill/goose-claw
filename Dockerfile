@@ -130,6 +130,9 @@ COPY config.default.yaml   /etc/goose/config.default.yaml
 COPY adversary.default.md  /etc/goose/adversary.default.md
 COPY docker-entrypoint.sh  /usr/local/bin/docker-entrypoint.sh
 # Default OpenAB config: Slack adapter + `[agent] command = goose acp`.
+# The entrypoint deep-merges an optional /etc/openab/config.override.toml over
+# this (same semantics as the goose config) into /data/.openab/config.toml,
+# which is what the CMD points at.
 COPY config.openab.toml    /etc/openab/config.toml
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -160,4 +163,4 @@ WORKDIR /data
 # (see config.openab.toml). No port is exposed — Slack Socket Mode is outbound.
 # Mount a volume at /data to persist all agent + OpenAB state across restarts.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+CMD ["openab", "run", "-c", "/data/.openab/config.toml"]

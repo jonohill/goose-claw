@@ -57,6 +57,36 @@ elif [[ -f "$ADV_DEFAULT" ]]; then
   cp "$ADV_DEFAULT" "$ADV_TARGET"
 fi
 
+# ---------------------------------------------------------------------------
+# OpenAB config
+# ---------------------------------------------------------------------------
+# Same precedence/merge semantics as the goose config above, but for the
+# OpenAB TOML: user override > baked default, per-key deep merge, arrays
+# replaced. `${VAR}` placeholders survive the merge as plain strings — OpenAB
+# expands them from the environment at load time, so an override can add new
+# runtime-tunable settings (e.g. extra [agent.env] vars) without restating the
+# whole file. Mounting over $AB_DEFAULT still works as a wholesale replacement.
+# The merged file lands under HOME because /etc is read-only to the goose user;
+# the image CMD points OpenAB at it.
+#
+#   OPENAB_CONFIG_OVERRIDE  path to an override TOML
+#                           (default /etc/openab/config.override.toml)
+#   OPENAB_CONFIG_MERGE=off use the override verbatim, ignore the baked default
+AB_DEFAULT=/etc/openab/config.toml
+AB_OVERRIDE=${OPENAB_CONFIG_OVERRIDE:-/etc/openab/config.override.toml}
+AB_TARGET="${HOME}/.openab/config.toml"
+
+# Skip entirely on variants without a baked OpenAB config (e.g. the goosed
+# HTTP-server image) unless an override is provided.
+if [[ -f "$AB_OVERRIDE" && ( "${OPENAB_CONFIG_MERGE:-on}" == "off" || ! -f "$AB_DEFAULT" ) ]]; then
+  cp "$AB_OVERRIDE" "$AB_TARGET"
+elif [[ -f "$AB_OVERRIDE" ]]; then
+  yq eval-all -p toml -o toml '. as $item ireduce ({}; . * $item)' \
+    "$AB_DEFAULT" "$AB_OVERRIDE" > "$AB_TARGET"
+elif [[ -f "$AB_DEFAULT" ]]; then
+  cp "$AB_DEFAULT" "$AB_TARGET"
+fi
+
 # Hand off to the image's command (goosed, openab, or anything else). Keeping
 # this generic lets a single entrypoint serve every image variant; the goose
 # config/adversary setup above is the shared invariant.

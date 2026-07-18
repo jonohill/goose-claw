@@ -11,7 +11,12 @@
 #     -v goose-state:/data \
 #     ghcr.io/<you>/goose-claw-slack
 #
-# To customise, mount your own file over /etc/openab/config.toml.
+# To customise, mount a partial override at /etc/openab/config.override.toml
+# (or set OPENAB_CONFIG_OVERRIDE to another path) — the entrypoint deep-merges
+# it over this file per-key (arrays are replaced). E.g. to add extra agent env
+# vars, an override containing just a [agent.env] table with the new keys is
+# enough. Set OPENAB_CONFIG_MERGE=off to use the override verbatim, or mount
+# your own file over /etc/openab/config.toml to replace the default wholesale.
 
 # --- Slack adapter (Socket Mode) -------------------------------------------
 # App setup (scopes, tokens, events) is documented by OpenAB in docs/slack.md.
