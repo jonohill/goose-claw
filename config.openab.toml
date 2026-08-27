@@ -63,10 +63,9 @@ GIT_EDITOR = "true"
 PAGER = "cat"
 LANG = "C.UTF-8"
 # --- provider: Ollama Cloud via its OpenAI-compatible endpoint ---
-# (verified working with the adversary reviewer using glm-5.2:cloud). Supply
-# OLLAMA_API_KEY at runtime: docker run -e OLLAMA_API_KEY=... ...
+# Supply OLLAMA_API_KEY at runtime: docker run -e OLLAMA_API_KEY=... ...
 GOOSE_PROVIDER = "openai"
-GOOSE_MODEL = "glm-5.2:cloud"
+GOOSE_MODEL = "glm-5.3-flash:cloud"
 OPENAI_BASE_URL = "https://ollama.com/v1"
 OPENAI_API_KEY = "${OLLAMA_API_KEY}"
 # Anthropic alternative:
